@@ -111,10 +111,11 @@ V7_PRIVATE struct ast_node_def ast_node_defs[] = {
   {"LSHIFT_ASSIGN", 0, 0, 2},  /* struct { child left, right; } */
   {"RSHIFT_ASSIGN", 0, 0, 2},  /* struct { child left, right; } */
   {"URSHIFT_ASSIGN", 0, 0, 2}, /* struct { child left, right; } */
-  {"IDENT", 4 + sizeof(char *), 0, 0},  /* struct { uint32_t len, char *s; } */
-  {"NUM", 8, 0, 0},                     /* struct { double n; } */
-  {"STRING", 4 + sizeof(char *), 0, 0}, /* struct { uint32_t len, char *s; } */
-  {"REGEX", 4 + sizeof(char *), 0, 0},  /* struct { uint32_t len, char *s; } */
+  {"NUM", 8, 0, 0},            /* struct { double n; } */
+  {"IDENT", 0, 0, 0},          /* struct { len_t len, char s[]; } */
+  {"STRING", 0, 0, 0},         /* struct { len_t len, char s[]; } */
+  {"REGEX", 0, 0, 0},          /* struct { len_t len, char s[]; } */
+  {"LABEL", 0, 0, 0},          /* struct { len_t len, char s[]; } */
   /*
    * struct {
    *   ast_skip_t end;
@@ -168,7 +169,6 @@ V7_PRIVATE struct ast_node_def ast_node_defs[] = {
   {"FOR_IN", 0, 1, 2},
   {"COND", 0, 0, 3},     /* struct { child cond, iftrue, iffalse; } */
   {"DEBUGGER", 0, 0, 0}, /* struct {} */
-  {"LABEL", 4 + sizeof(char *), 0, 0}, /* struct { uint32_t len, char *s; } */
   {"BREAK", 0, 0, 0},                  /* struct {} */
   /*
    * struct {
@@ -361,6 +361,47 @@ V7_STATIC_ASSERT(AST_MAX_TAG == ARRAY_SIZE(ast_node_defs), bad_node_defs);
  * TODO(mkm): optimize to our specific use case or fully reuse fossa.
  */
 
+/*
+ * Strings in AST are encoded as tuples (length, string).
+ * Length is variable-length: if high bit is set in a byte, next byte is used.
+ * Maximum string length with such encoding is 2 ^ (7 * 4) == 256 MiB,
+ * assuming that sizeof(v7_strlen_t) == 4.
+ * Small string length (less then 128 bytes) is encoded in 1 byte.
+ */
+static v7_strlen_t decode_string_len(const unsigned char *p, int *llen) {
+  v7_strlen_t i, len = 0;
+
+  *llen = 0;
+  for (i = 0; i < sizeof(v7_strlen_t) / sizeof(char); i++) {
+    len <<= 7;
+    len |= p[i] & 0x7f;
+    (*llen)++;
+    if (!(p[i] & 0x80)) break;
+  }
+
+  return len;
+}
+
+/* Return number of bytes to store length */
+static int calc_llen(v7_strlen_t len) {
+  /* NOTE(lsm): that assumes sizeof(v7_strlen_t) == 4. Refactor if not. */
+  assert(len < 0xfffffff);
+  return len < 0x80 ? 1 : len < 0x3fff ? 2 : len < 0x1fffff ? 3 : 4;
+}
+
+static void encode_string_len(v7_strlen_t len, unsigned char *p) {
+  int i;
+  for (i = 0; i < (int) (sizeof(v7_strlen_t) / sizeof(char)); i++) {
+    p[i] = len & 0x7f;
+    len >>= 7;
+    if (len > 0) {
+      p[i] |= 0x80;
+    } else {
+      break;
+    }
+  }
+}
+
 /* Initializes an AST buffer. */
 V7_PRIVATE void ast_init(struct ast *ast, size_t initial_size) {
   ast->len = ast->size = 0;
@@ -505,7 +546,7 @@ V7_STATIC_ASSERT(sizeof(ast_skip_t) == 2, ast_skip_t_len_should_be_2);
  *
  * Every tree reader can assume this and safely skip unknown nodes.
  */
-V7_PRIVATE size_t ast_set_skip(struct ast *a, size_t start,
+V7_PRIVATE size_t ast_set_skip(struct ast *a, ast_off_t start,
                                enum ast_which_skip skip) {
   uint8_t *p = (uint8_t *) a->buf + start + skip * sizeof(ast_skip_t);
   uint16_t delta = a->len - start;
@@ -549,38 +590,39 @@ V7_PRIVATE void ast_add_num(struct ast *a, double num) {
   memcpy(a->buf + start, &num, sizeof(num));
 }
 
-static void ast_set_string(char *buf, const char *name, size_t len) {
-  uint32_t slen = (uint32_t) len;
-  /* 4GB ought to be enough for anybody */
-  if (sizeof(size_t) == 8) {
-    assert((len & 0xFFFFFFFF00000000) == 0);
-  }
-  memcpy(buf, &slen, sizeof(slen));
-  memcpy(buf + sizeof(slen), &name, sizeof(char *));
+static void ast_set_string(struct ast *a, size_t off, const char *name,
+                           size_t len) {
+  /* Encode string length first */
+  int n = calc_llen(len);   /* Calculate how many bytes length occupies */
+  ast_insert(a, off, "    ", n);  /* Allocate  buffer for length in the AST */
+  encode_string_len(len, (unsigned char *) a->buf + off);   /* Write length */
+
+  /* Now copy the string itself */
+  ast_insert(a, off + n, name, len);
 }
 
 /* Helper to add an IDENT node. */
 V7_PRIVATE void ast_add_ident(struct ast *a, const char *name, size_t len) {
   size_t start = ast_add_node(a, AST_IDENT);
-  ast_set_string(a->buf + start, name, len);
+  ast_set_string(a, start, name, len);
 }
 
 /* Helper to add a STRING node. */
 V7_PRIVATE void ast_add_string(struct ast *a, const char *name, size_t len) {
   size_t start = ast_add_node(a, AST_STRING);
-  ast_set_string(a->buf + start, name, len);
+  ast_set_string(a, start, name, len);
 }
 
 /* Helper to add a REGEX node. */
 V7_PRIVATE void ast_add_regex(struct ast *a, const char *name, size_t len) {
   size_t start = ast_add_node(a, AST_REGEX);
-  ast_set_string(a->buf + start, name, len);
+  ast_set_string(a, start, name, len);
 }
 
 /* Helper to add a LABEL node. */
 V7_PRIVATE void ast_add_label(struct ast *a, const char *name, size_t len) {
   size_t start = ast_add_node(a, AST_LABEL);
-  ast_set_string(a->buf + start, name, len);
+  ast_set_string(a, start, name, len);
 }
 
 static void comment_at_depth(FILE *fp, const char *fmt, int depth, ...) {
@@ -599,9 +641,10 @@ static void comment_at_depth(FILE *fp, const char *fmt, int depth, ...) {
 
 static void ast_dump_tree(FILE *fp, struct ast *a, ast_off_t *pos, int depth) {
   enum ast_tag tag = ast_fetch_tag(a, pos);
-  struct ast_node_def *def = &ast_node_defs[tag];
+  const struct ast_node_def *def = &ast_node_defs[tag];
   ast_off_t skips = *pos;
-  int i;
+  v7_strlen_t slen;
+  int i, llen;
   double dv;
 
   for (i = 0; i < depth; i++) {
@@ -616,14 +659,12 @@ static void ast_dump_tree(FILE *fp, struct ast *a, ast_off_t *pos, int depth) {
       fprintf(fp, " %lf\n", dv);
       break;
     case AST_IDENT:
-      fprintf(fp, " %.*s\n", * (int *) (a->buf + *pos),
-              * (char **) (a->buf + *pos + sizeof(uint32_t)));
-      break;
     case AST_STRING:
     case AST_REGEX:
     case AST_LABEL:
-      fprintf(fp, " \"%.*s\"\n", * (int *) (a->buf + *pos),
-              * (char **) (a->buf + *pos + sizeof(uint32_t)));
+      slen = decode_string_len((unsigned char *) a->buf + *pos, &llen);
+      fprintf(fp, " \"%.*s\"\n", (int) slen, a->buf + *pos + llen);
+      *pos += llen + slen;
       break;
     default:
       fprintf(fp, "\n");
